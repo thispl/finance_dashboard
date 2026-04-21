@@ -118,38 +118,63 @@ def get_kpis(filters):
 			AND gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
 			AND gle.is_cancelled = 0
 			AND IFNULL(gle.is_opening, 'No') = 'No'
+			AND acc.include_in_gross = 1
+	""", gl_filters, as_dict=1)[0].total or 0
+	
+	total_expenses_net = frappe.db.sql("""
+		SELECT IFNULL(SUM(gle.debit - gle.credit), 0) as total
+		FROM `tabGL Entry` gle
+		JOIN `tabAccount` acc ON acc.name = gle.account
+		WHERE acc.root_type = 'Expense'
+			AND gle.company = %(company)s
+			AND gle.posting_date BETWEEN %(from_date)s AND %(to_date)s
+			AND gle.is_cancelled = 0
+			AND IFNULL(gle.is_opening, 'No') = 'No'
 	""", gl_filters, as_dict=1)[0].total or 0
 
 	ar_outstanding = frappe.db.sql("""
-		SELECT IFNULL(SUM(gle.debit - gle.credit), 0) as total
-		FROM `tabGL Entry` gle
-		JOIN `tabAccount` acc ON acc.name = gle.account
-		WHERE acc.account_type = 'Receivable'
+		SELECT
+			IFNULL(SUM(
+				gle.amount), 0) as total
+		FROM `tabPayment Ledger Entry` gle
+		WHERE gle.account_type = 'Receivable'
+			AND gle.party_type = 'Customer'
 			AND gle.company = %(company)s
 			AND gle.posting_date <= %(to_date)s
-			AND gle.is_cancelled = 0
+			AND gle.delinked = 0
 	""", gl_filters, as_dict=1)[0].total or 0
 
 	ap_outstanding = frappe.db.sql("""
-		SELECT IFNULL(SUM(gle.credit - gle.debit), 0) as total
-		FROM `tabGL Entry` gle
-		JOIN `tabAccount` acc ON acc.name = gle.account
-		WHERE acc.account_type = 'Payable'
+		SELECT
+			IFNULL(SUM(
+				gle.amount), 0) as total
+		FROM `tabPayment Ledger Entry` gle
+		WHERE gle.account_type = 'Payable'
+			AND gle.party_type = 'Supplier'
 			AND gle.company = %(company)s
 			AND gle.posting_date <= %(to_date)s
-			AND gle.is_cancelled = 0
+			AND gle.delinked = 0
 	""", gl_filters, as_dict=1)[0].total or 0
 
-	cash_balance = frappe.db.sql("""
-		SELECT IFNULL(SUM(gle.debit - gle.credit), 0) as total
+	cash_balance_amount = frappe.db.sql("""
+		SELECT 
+			acc.name,
+			acc.account_name,
+			IFNULL(SUM(gle.debit), 0) as total_debit,
+			IFNULL(SUM(gle.credit), 0) as total_credit,
+			IFNULL(SUM(gle.debit - gle.credit), 0) as closing_balance
 		FROM `tabGL Entry` gle
 		JOIN `tabAccount` acc ON acc.name = gle.account
-		WHERE acc.account_type IN ('Bank', 'Cash')
-			AND gle.company = %(company)s
+		WHERE acc.account_type IN ('Cash', 'Bank')
+			AND acc.company = %(company)s
 			AND gle.posting_date <= %(to_date)s
 			AND gle.is_cancelled = 0
-	""", gl_filters, as_dict=1)[0].total or 0
-
+			AND acc.is_group = 0
+			AND acc.root_type = 'Asset'
+			AND acc.disabled = 0
+		GROUP BY acc.name
+	""", filters, as_dict=1)
+	cash_balance = sum(d.closing_balance for d in cash_balance_amount)
 	inventory_value = frappe.db.sql("""
 		SELECT IFNULL(SUM(b.stock_value), 0) as total
 		FROM `tabBin` b
@@ -169,10 +194,10 @@ def get_kpis(filters):
 			AND posting_date BETWEEN %(from_date)s AND %(to_date)s AND is_return = 0
 	""", gl_filters, as_dict=1)[0].cnt or 0
 
-	gross_profit = flt(revenue) - flt(cogs)
+	gross_profit = flt(revenue) - flt(total_expenses)
 	gross_margin = (gross_profit / revenue * 100) if revenue else 0
 	opex = flt(total_expenses) - flt(cogs)
-	net_profit = flt(revenue) - flt(total_expenses)
+	net_profit = flt(revenue) - flt(total_expenses_net)
 	net_margin = (net_profit / revenue * 100) if revenue else 0
 
 	return {
@@ -180,7 +205,7 @@ def get_kpis(filters):
 		"gross_profit": flt(gross_profit, 2), "gross_margin": flt(gross_margin, 1),
 		"total_expenses": flt(total_expenses, 2), "opex": flt(opex, 2),
 		"net_profit": flt(net_profit, 2), "net_margin": flt(net_margin, 1),
-		"ar_outstanding": flt(ar_outstanding, 2), "ap_outstanding": flt(ap_outstanding, 2),
+		"ar_outstanding": flt(ar_outstanding, 3), "ap_outstanding": flt(ap_outstanding, 2),
 		"cash_balance": flt(cash_balance, 2), "inventory_value": flt(inventory_value, 2),
 		"si_count": si_count, "pi_count": pi_count,
 	}
@@ -415,15 +440,16 @@ def get_bank_balances(filters):
 			acc.name as account,
 			acc.account_name,
 			acc.account_type,
-			IFNULL(SUM(gle.debit - gle.credit), 0) as balance
+			IFNULL(SUM(gle.debit_in_account_currency - gle.credit_in_account_currency), 0) as balance
 		FROM `tabGL Entry` gle
 		JOIN `tabAccount` acc ON acc.name = gle.account
 		WHERE acc.account_type IN ('Bank', 'Cash')
 			AND gle.company = %(company)s
 			AND gle.posting_date <= %(to_date)s
 			AND gle.is_cancelled = 0
+			AND acc.root_type = 'Asset'
+			AND acc.disabled = 0
 		GROUP BY acc.name
-		HAVING balance != 0
 		ORDER BY balance DESC
 	""", filters, as_dict=1)
 
@@ -1189,48 +1215,55 @@ def get_inventory_turnover(filters):
 
 
 def get_trial_balance(filters):
-	"""Trial balance — opening + period movement + closing for all accounts."""
-	data = frappe.db.sql("""
-		SELECT
-			acc.name as account,
-			acc.account_name,
-			acc.root_type,
-			acc.is_group,
-			acc.parent_account,
-			IFNULL(SUM(CASE WHEN gle.posting_date < %(from_date)s THEN gle.debit ELSE 0 END), 0) as opening_debit,
-			IFNULL(SUM(CASE WHEN gle.posting_date < %(from_date)s THEN gle.credit ELSE 0 END), 0) as opening_credit,
-			IFNULL(SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s THEN gle.debit ELSE 0 END), 0) as period_debit,
-			IFNULL(SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s THEN gle.credit ELSE 0 END), 0) as period_credit,
-			IFNULL(SUM(CASE WHEN gle.posting_date <= %(to_date)s THEN gle.debit ELSE 0 END), 0) as closing_debit,
-			IFNULL(SUM(CASE WHEN gle.posting_date <= %(to_date)s THEN gle.credit ELSE 0 END), 0) as closing_credit
-		FROM `tabAccount` acc
-		LEFT JOIN `tabGL Entry` gle ON gle.account = acc.name
-			AND gle.company = %(company)s
-			AND gle.is_cancelled = 0
-			AND gle.posting_date <= %(to_date)s
-		WHERE acc.company = %(company)s
+
+    data = frappe.db.sql("""
+        SELECT
+            acc.name AS account,
+            acc.account_name,
+            acc.root_type,
+            acc.parent_account,
+
+            IFNULL(SUM(CASE 
+                WHEN gle.posting_date < %(from_date)s 
+                THEN gle.debit END), 0) AS opening_debit,
+
+            IFNULL(SUM(CASE 
+                WHEN gle.posting_date < %(from_date)s 
+                THEN gle.credit END), 0) AS opening_credit,
+                
+            SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s THEN gle.debit ELSE 0 END) AS period_debit,
+            SUM(CASE WHEN gle.posting_date BETWEEN %(from_date)s AND %(to_date)s THEN gle.credit ELSE 0 END) AS period_credit,
+
+            SUM(CASE WHEN gle.posting_date <= %(to_date)s THEN gle.debit ELSE 0 END) AS closing_debit,
+            SUM(CASE WHEN gle.posting_date <= %(to_date)s THEN gle.credit ELSE 0 END) AS closing_credit
+
+        FROM `tabGL Entry` gle
+        INNER JOIN `tabAccount` acc ON acc.name = gle.account
+
+        WHERE gle.company = %(company)s
+            AND gle.is_cancelled = 0
+            AND gle.posting_date <= %(to_date)s
+            AND acc.company = %(company)s
+			AND acc.disabled = 0
 			AND acc.is_group = 0
-		GROUP BY acc.name
-		HAVING (opening_debit != 0 OR opening_credit != 0 OR period_debit != 0
-			OR period_credit != 0 OR closing_debit != 0 OR closing_credit != 0)
-		ORDER BY acc.root_type, acc.name
-	""", filters, as_dict=1)
+        GROUP BY acc.name, acc.root_type
+        ORDER BY acc.root_type, acc.lft
+    """, filters, as_dict=1)
 
-	for row in data:
-		row["opening_balance"] = flt(row.opening_debit - row.opening_credit, 2)
-		row["closing_balance"] = flt(row.closing_debit - row.closing_credit, 2)
+    for row in data:
+        row["opening_balance"] = flt(row.opening_debit - row.opening_credit, 2)
+        row["closing_balance"] = flt(row.closing_debit - row.closing_credit, 2)
 
-	totals = {
-		"opening_debit": flt(sum(r.opening_debit for r in data), 2),
-		"opening_credit": flt(sum(r.opening_credit for r in data), 2),
-		"period_debit": flt(sum(r.period_debit for r in data), 2),
-		"period_credit": flt(sum(r.period_credit for r in data), 2),
-		"closing_debit": flt(sum(r.closing_debit for r in data), 2),
-		"closing_credit": flt(sum(r.closing_credit for r in data), 2),
-	}
+    totals = {
+        "opening_debit": flt(sum(r.opening_debit for r in data), 2),
+        "opening_credit": flt(sum(r.opening_credit for r in data), 2),
+        "period_debit": flt(sum(r.period_debit for r in data), 2),
+        "period_credit": flt(sum(r.period_credit for r in data), 2),
+        "closing_debit": flt(sum(r.closing_debit for r in data), 2),
+        "closing_credit": flt(sum(r.closing_credit for r in data), 2),
+    }
 
-	return {"items": data, "totals": totals}
-
+    return {"items": data, "totals": totals}
 
 def get_ratio_trend(filters):
 	"""Financial ratio trend — monthly DSO, DPO, current ratio, net margin over 6 months."""
