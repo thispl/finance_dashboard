@@ -3,8 +3,8 @@
  "creation": "2026-02-16 21:03:17.451933",
  "docstatus": 0,
  "doctype": "Page",
- "idx": 0,
- "modified": "2026-02-16 21:03:17.451933",
+ "idx": 6,
+ "modified": "2026-04-24 14:19:50.078416",
  "modified_by": "Administrator",
  "module": "Finance Dashboard",
  "name": "finance-dashboard",
@@ -15,7 +15,7 @@
    "role": "Accounts Manager"
   },
   {
-   "role": "System Manager"
+   "role": "HR Manager"
   }
  ],
  "script": null,
